@@ -51,10 +51,10 @@ jobs:
       - name: Show installed versions
         run: |
           uv run python -c "
-          import pydantic, pyarrow, typing_inspection
+          import importlib.metadata, pydantic, pyarrow
           print(f'pydantic={pydantic.__version__}')
           print(f'pyarrow={pyarrow.__version__}')
-          print(f'typing-inspection={typing_inspection.__version__}')
+          print(f'typing-inspection={importlib.metadata.version(\"typing-inspection\")}')
           "
 
       - name: Run tests
