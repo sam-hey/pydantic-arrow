@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum, StrEnum
@@ -125,6 +126,134 @@ def prebuilt_rows() -> list[dict]:
     """50 K pre-built row dicts.  Session-scoped so they are allocated once and
     not counted against any individual test's memray budget."""
     return [{"name": f"user_{i}", "age": i % 100, "score": float(i), "active": i % 2 == 0} for i in range(50_000)]
+
+
+# ---------------------------------------------------------------------------
+# Coercion test models (plain enum.Enum / UUID / dict fields)
+# ---------------------------------------------------------------------------
+
+
+class Color(enum.Enum):
+    """Plain enum.Enum with string values — NOT a StrEnum subclass."""
+
+    RED = "red"
+    BLUE = "blue"
+    GREEN = "green"
+
+
+class Severity(enum.IntEnum):
+    """Plain enum.IntEnum."""
+
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+
+class ModelWithStrEnum(BaseModel):
+    name: str
+    color: Color
+
+
+class ModelWithIntEnum(BaseModel):
+    name: str
+    severity: Severity
+
+
+class ModelWithUUID(BaseModel):
+    id: UUID
+    label: str
+
+
+class ModelWithDict(BaseModel):
+    tags: dict[str, int]
+
+
+class ModelWithDictOfStr(BaseModel):
+    labels: dict[str, str]
+
+
+class ModelWithOptionalDict(BaseModel):
+    metadata: dict[str, str] | None = None
+
+
+class ModelWithDictOfList(BaseModel):
+    groups: dict[str, list[int]]
+
+
+class ComplexModel(BaseModel):
+    """Model that exercises StrEnum + UUID + dict[str, int] coercion together."""
+
+    name: str
+    color: Color
+    scores: dict[str, int]
+    uid: UUID
+
+
+# ---------------------------------------------------------------------------
+# Schema-mismatch models (used by TestParquetSchemaMismatch)
+# ---------------------------------------------------------------------------
+
+
+class WriterModel(BaseModel):
+    """Written to Parquet; other models attempt to read it back."""
+
+    name: str
+    age: int
+    score: float
+
+
+class ReaderSubset(BaseModel):
+    """Reads only a subset of the writer's columns."""
+
+    name: str
+
+
+class ReaderOptionalExtra(BaseModel):
+    """Adds an optional column absent from the file; defaults to None."""
+
+    name: str
+    age: int
+    score: float
+    country: str | None = None
+
+
+class ReaderMissingRequiredField(BaseModel):
+    """Demands a column ('country') that does not exist in the file."""
+
+    name: str
+    age: int
+    score: float
+    country: str
+
+
+class ReaderWrongType(BaseModel):
+    """Expects 'age' as str, but it is stored as int."""
+
+    name: str
+    age: str
+    score: float
+
+
+class ReaderTotallyDifferent(BaseModel):
+    """Shares no columns at all with WriterModel."""
+
+    product: str
+    price: float
+
+
+@pytest.fixture(scope="session")
+def writer_parquet(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Parquet file written by WriterModel; shared across all schema-mismatch tests."""
+    from pydantic_arrow import ArrowFrame
+
+    path = tmp_path_factory.mktemp("schema_mismatch") / "writer.parquet"
+    ArrowFrame[WriterModel].from_rows(
+        [
+            WriterModel(name="Alice", age=30, score=9.5),
+            WriterModel(name="Bob", age=25, score=7.0),
+        ]
+    ).to_parquet(path)
+    return path
 
 
 @pytest.fixture(scope="session")

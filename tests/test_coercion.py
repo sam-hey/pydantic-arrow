@@ -1,318 +1,346 @@
+"""Tests for type coercion between Pydantic models and Apache Arrow."""
+
 from __future__ import annotations
 
-import enum
 import uuid
 from typing import Any
 
 import pyarrow as pa
-from pydantic import BaseModel
+import pytest
+from pydantic import ValidationError
 
 from pydantic_arrow import ArrowFrame, model_to_schema
 from pydantic_arrow._convert import batch_to_models, models_to_batch
+from tests.conftest import (
+    Color,
+    ComplexModel,
+    ModelWithDict,
+    ModelWithDictOfList,
+    ModelWithDictOfStr,
+    ModelWithIntEnum,
+    ModelWithOptionalDict,
+    ModelWithStrEnum,
+    ModelWithUUID,
+    ReaderMissingRequiredField,
+    ReaderOptionalExtra,
+    ReaderSubset,
+    ReaderTotallyDifferent,
+    ReaderWrongType,
+    Severity,
+)
 
 # ---------------------------------------------------------------------------
-# Shared fixtures
+# Parametrize helpers
+# ---------------------------------------------------------------------------
+
+_FIXED_UUID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+_FIVE_UUIDS = [uuid.UUID(int=i + 1) for i in range(5)]
+
+
+def _round_trip_params():
+    """(id, list-of-instances) pairs covering every coercion-sensitive model."""
+    return [
+        pytest.param(
+            [ModelWithStrEnum(name="Alice", color=Color.RED)],
+            id="str-enum-single",
+        ),
+        pytest.param(
+            [
+                ModelWithStrEnum(name="Alice", color=Color.RED),
+                ModelWithStrEnum(name="Bob", color=Color.BLUE),
+                ModelWithStrEnum(name="Carol", color=Color.GREEN),
+            ],
+            id="str-enum-multiple",
+        ),
+        pytest.param(
+            [ModelWithIntEnum(name="Dev", severity=Severity.HIGH)],
+            id="int-enum",
+        ),
+        pytest.param(
+            [ModelWithUUID(id=_FIXED_UUID, label="x")],
+            id="uuid-single",
+        ),
+        pytest.param(
+            [ModelWithUUID(id=uid, label=str(i)) for i, uid in enumerate(_FIVE_UUIDS)],
+            id="uuid-multiple",
+        ),
+        pytest.param(
+            [ModelWithDict(tags={"a": 1, "b": 2})],
+            id="dict-str-int",
+        ),
+        pytest.param(
+            [ModelWithDictOfStr(labels={"env": "prod", "region": "eu-west"})],
+            id="dict-str-str",
+        ),
+        pytest.param(
+            [ModelWithDictOfList(groups={"odds": [1, 3, 5], "evens": [2, 4]})],
+            id="dict-of-list",
+        ),
+        pytest.param(
+            [
+                ComplexModel(
+                    name="Alice",
+                    color=Color.RED,
+                    scores={"math": 95, "art": 80},
+                    uid=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                ),
+                ComplexModel(
+                    name="Bob",
+                    color=Color.BLUE,
+                    scores={"science": 88},
+                    uid=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                ),
+            ],
+            id="complex",
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# TestRoundTrip — from_rows / to_parquet / from_parquet
 # ---------------------------------------------------------------------------
 
 
-class Color(enum.Enum):
-    """StrEnum: values are strings."""
+class TestRoundTrip:
+    """Round-trip every coercion-sensitive model through all major code paths."""
 
-    RED = "red"
-    BLUE = "blue"
-    GREEN = "green"
+    @pytest.mark.parametrize("instances", _round_trip_params())
+    def test_from_rows_collect(self, instances):
+        """from_rows([…]).collect() returns the original instances."""
+        Model = type(instances[0])
+        assert ArrowFrame[Model].from_rows(instances).collect() == instances
 
-
-class Priority(enum.IntEnum):
-    """IntEnum: values are ints — works today, kept for contrast."""
-
-    LOW = 1
-    MEDIUM = 2
-    HIGH = 3
-
-
-class ModelWithStrEnum(BaseModel):
-    name: str
-    color: Color
-
-
-class ModelWithIntEnum(BaseModel):
-    name: str
-    priority: Priority
-
-
-class ModelWithUUID(BaseModel):
-    id: uuid.UUID
-    label: str
-
-
-class ModelWithDict(BaseModel):
-    tags: dict[str, int]
-
-
-class ModelWithDictOfStr(BaseModel):
-    labels: dict[str, str]
-
-
-class ModelWithOptionalDict(BaseModel):
-    metadata: dict[str, str] | None = None
-
-
-class ModelWithDictOfList(BaseModel):
-    groups: dict[str, list[int]]
-
-
-class TestFromRowsStrEnum:
-    def test_single_instance_round_trips(self):
-        """ArrowFrame[M].from_rows([m]).collect() should return [m]."""
-        m = ModelWithStrEnum(name="Alice", color=Color.RED)
-        frame = ArrowFrame[ModelWithStrEnum].from_rows([m])
-        result = frame.collect()
-        assert result == [m]
-
-    def test_multiple_instances_round_trip(self):
-        instances = [
-            ModelWithStrEnum(name="Alice", color=Color.RED),
-            ModelWithStrEnum(name="Bob", color=Color.BLUE),
-            ModelWithStrEnum(name="Carol", color=Color.GREEN),
-        ]
-        frame = ArrowFrame[ModelWithStrEnum].from_rows(instances)
-        assert frame.collect() == instances
-
-    def test_to_arrow_then_collect(self):
-        """from_rows().to_arrow() should not raise."""
-        m = ModelWithStrEnum(name="Alice", color=Color.RED)
-        table = ArrowFrame[ModelWithStrEnum].from_rows([m]).to_arrow()
+    @pytest.mark.parametrize("instances", _round_trip_params())
+    def test_to_arrow_then_from_arrow(self, instances):
+        """from_rows → to_arrow → from_arrow → collect preserves every row."""
+        Model = type(instances[0])
+        table = ArrowFrame[Model].from_rows(instances).to_arrow()
         assert isinstance(table, pa.Table)
-        assert table.num_rows == 1
+        assert table.num_rows == len(instances)
+        assert ArrowFrame[Model].from_arrow(table).collect() == instances
 
-    def test_schema_uses_dictionary_type(self):
-        """StrEnum → dictionary<int32, utf8> schema should be generated."""
-        schema = model_to_schema(ModelWithStrEnum)
-        color_field = schema.field("color")
-        assert pa.types.is_dictionary(color_field.type), f"Expected dictionary type for StrEnum, got {color_field.type}"
-
-    def test_dict_of_rows_also_works(self):
-        """from_rows with plain dicts should still work as a control case."""
-        rows = [{"name": "Alice", "color": "red"}]
-        frame = ArrowFrame[ModelWithStrEnum].from_rows(rows)
-        result = frame.collect()
-        assert result[0].color == Color.RED
-
-
-class TestFromRowsUUID:
-    def test_single_uuid_round_trips(self):
-        """UUID field: from_rows([m]).collect() should return [m]."""
-        m = ModelWithUUID(id=uuid.UUID("12345678-1234-5678-1234-567812345678"), label="x")
-        result = ArrowFrame[ModelWithUUID].from_rows([m]).collect()
-        assert result == [m]
-
-    def test_uuid_stored_as_string_in_arrow(self):
-        """UUID should be stored as utf8 in Arrow (canonical hex string)."""
-        m = ModelWithUUID(id=uuid.UUID("12345678-1234-5678-1234-567812345678"), label="x")
-        table = ArrowFrame[ModelWithUUID].from_rows([m]).to_arrow()
-        assert pa.types.is_string(table.schema.field("id").type)
-        assert table["id"][0].as_py() == "12345678-1234-5678-1234-567812345678"
-
-    def test_multiple_uuids_round_trip(self):
-        instances = [ModelWithUUID(id=uuid.uuid4(), label=str(i)) for i in range(5)]
-        result = ArrowFrame[ModelWithUUID].from_rows(instances).collect()
-        assert result == instances
-
-    def test_parquet_round_trip(self, tmp_path):
-        """UUID survives a Parquet write/read cycle via from_rows."""
-        m = ModelWithUUID(id=uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), label="y")
-        path = tmp_path / "uuids.parquet"
-        ArrowFrame[ModelWithUUID].from_rows([m]).to_parquet(path)
-        result = ArrowFrame[ModelWithUUID].from_parquet(path).collect()
-        assert result == [m]
+    @pytest.mark.parametrize("instances", _round_trip_params())
+    def test_parquet_round_trip(self, tmp_path, instances):
+        """from_rows → to_parquet → from_parquet → collect survives disk."""
+        Model = type(instances[0])
+        path = tmp_path / "round_trip.parquet"
+        ArrowFrame[Model].from_rows(instances).to_parquet(path)
+        assert ArrowFrame[Model].from_parquet(path).collect() == instances
 
 
 # ---------------------------------------------------------------------------
-# Control: IntEnum works today (regression guard)
+# TestSchemaTypes — verify Arrow column types for coercion-sensitive fields
 # ---------------------------------------------------------------------------
 
 
-class TestFromRowsIntEnum:
-    """IntEnum already works — these tests must remain green after the fix."""
+class TestSchemaTypes:
+    """Arrow schema must map each field to the correct column type."""
 
-    def test_int_enum_round_trips(self):
-        m = ModelWithIntEnum(name="Dev", priority=Priority.HIGH)
-        result = ArrowFrame[ModelWithIntEnum].from_rows([m]).collect()
-        assert result == [m]
+    @pytest.mark.parametrize(
+        "Model,field_name,type_check",
+        [
+            pytest.param(
+                ModelWithStrEnum,
+                "color",
+                pa.types.is_dictionary,
+                id="str-enum-dictionary",
+            ),
+            pytest.param(
+                ModelWithIntEnum,
+                "severity",
+                lambda t: t == pa.int64(),
+                id="int-enum-int64",
+            ),
+            pytest.param(
+                ModelWithUUID,
+                "id",
+                pa.types.is_string,
+                id="uuid-string",
+            ),
+            pytest.param(
+                ModelWithDict,
+                "tags",
+                pa.types.is_map,
+                id="dict-map",
+            ),
+            pytest.param(
+                ModelWithDictOfList,
+                "groups",
+                pa.types.is_map,
+                id="dict-of-list-map",
+            ),
+        ],
+    )
+    def test_field_arrow_type(self, Model, field_name, type_check):
+        schema = model_to_schema(Model)
+        assert type_check(schema.field(field_name).type), (
+            f"{Model.__name__}.{field_name}: unexpected type {schema.field(field_name).type}"
+        )
 
-    def test_int_enum_stored_as_int64(self):
-        schema = model_to_schema(ModelWithIntEnum)
-        assert schema.field("priority").type == pa.int64()
+
+# ---------------------------------------------------------------------------
+# TestDictMapCoercion — batch-level coercion for map<K,V> columns
+# ---------------------------------------------------------------------------
 
 
-class TestBatchToModelsDict:
-    def test_dict_str_int_round_trips(self):
-        """dict[str, int] field should survive batch_to_models."""
-        m = ModelWithDict(tags={"a": 1, "b": 2, "c": 3})
-        schema = model_to_schema(ModelWithDict)
-        batch = models_to_batch([m], schema)
-        result = list(batch_to_models(batch, ModelWithDict))
-        assert result == [m]
+class TestDictMapCoercion:
+    """Arrow map<K,V> must survive the models_to_batch → batch_to_models round-trip."""
 
-    def test_dict_str_str_round_trips(self):
-        m = ModelWithDictOfStr(labels={"env": "prod", "region": "eu-central"})
-        schema = model_to_schema(ModelWithDictOfStr)
-        batch = models_to_batch([m], schema)
-        result = list(batch_to_models(batch, ModelWithDictOfStr))
-        assert result == [m]
+    @pytest.mark.parametrize(
+        "instance",
+        [
+            pytest.param(ModelWithDict(tags={"a": 1, "b": 2, "c": 3}), id="str-int"),
+            pytest.param(ModelWithDictOfStr(labels={"env": "prod", "region": "eu"}), id="str-str"),
+            pytest.param(ModelWithDict(tags={}), id="empty"),
+            pytest.param(ModelWithOptionalDict(metadata=None), id="optional-none"),
+            pytest.param(ModelWithOptionalDict(metadata={"key": "value"}), id="optional-present"),
+            pytest.param(
+                ModelWithDictOfList(groups={"a": [1, 2], "b": [3]}),
+                id="dict-of-list",
+            ),
+        ],
+    )
+    def test_batch_round_trip(self, instance):
+        """models_to_batch + batch_to_models returns the original instance."""
+        Model = type(instance)
+        schema = model_to_schema(Model)
+        batch = models_to_batch([instance], schema)
+        assert list(batch_to_models(batch, Model)) == [instance]
 
-    def test_empty_dict_round_trips(self):
-        m = ModelWithDict(tags={})
-        schema = model_to_schema(ModelWithDict)
-        batch = models_to_batch([m], schema)
-        result = list(batch_to_models(batch, ModelWithDict))
-        assert result == [m]
-
-    def test_optional_dict_none_round_trips(self):
-        m = ModelWithOptionalDict(metadata=None)
-        schema = model_to_schema(ModelWithOptionalDict)
-        batch = models_to_batch([m], schema)
-        result = list(batch_to_models(batch, ModelWithOptionalDict))
-        assert result == [m]
-
-    def test_optional_dict_present_round_trips(self):
-        m = ModelWithOptionalDict(metadata={"key": "value"})
-        schema = model_to_schema(ModelWithOptionalDict)
-        batch = models_to_batch([m], schema)
-        result = list(batch_to_models(batch, ModelWithOptionalDict))
-        assert result == [m]
-
-    def test_multiple_dict_rows_round_trip(self):
+    def test_multiple_rows_batch_round_trip(self):
+        """Multiple rows with varying dict sizes all survive the batch cycle."""
         instances = [
             ModelWithDict(tags={"x": 10}),
             ModelWithDict(tags={"y": 20, "z": 30}),
         ]
         schema = model_to_schema(ModelWithDict)
         batch = models_to_batch(instances, schema)
-        result = list(batch_to_models(batch, ModelWithDict))
-        assert result == instances
+        assert list(batch_to_models(batch, ModelWithDict)) == instances
 
-
-# ---------------------------------------------------------------------------
-# BUG-2 via full ArrowFrame pipeline
-# ---------------------------------------------------------------------------
-
-
-class TestArrowFrameDictRoundTrip:
-    """End-to-end round-trips that combine BUG-1 and BUG-2 fixes."""
-
-    def test_frame_from_rows_dict_collect(self):
-        """from_rows → to_arrow → from_arrow → collect for dict field."""
-        m = ModelWithDict(tags={"a": 1, "b": 2})
-        schema = model_to_schema(ModelWithDict)
-        batch = models_to_batch([m], schema)
-        table = pa.Table.from_batches([batch], schema=schema)
-        frame = ArrowFrame[ModelWithDict].from_arrow(table)
-        result = frame.collect()
-        assert result == [m]
-
-    def test_frame_parquet_dict_round_trip(self, tmp_path):
-        """dict[str,int] survives Parquet write/read via ArrowFrame."""
-        instances = [
-            ModelWithDict(tags={"alpha": 1}),
-            ModelWithDict(tags={"beta": 2, "gamma": 3}),
-        ]
-        schema = model_to_schema(ModelWithDict)
-        batch = models_to_batch(instances, schema)
-        table = pa.Table.from_batches([batch], schema=schema)
-        path = tmp_path / "dicts.parquet"
-        ArrowFrame[ModelWithDict].from_arrow(table).to_parquet(path)
-        result = ArrowFrame[ModelWithDict].from_parquet(path).collect()
-        assert result == instances
-
-
-# ---------------------------------------------------------------------------
-# Combined: model with both StrEnum and dict — tests full fix integration
-# ---------------------------------------------------------------------------
-
-
-class ComplexModel(BaseModel):
-    name: str
-    color: Color
-    scores: dict[str, int]
-    uid: uuid.UUID
-
-
-class TestComplexModelFullRoundTrip:
-    def test_from_rows_collect(self):
-        """Model with StrEnum + UUID + dict[str,int] should round-trip via from_rows."""
-        m = ComplexModel(
-            name="Alice",
-            color=Color.RED,
-            scores={"math": 95, "art": 80},
-            uid=uuid.UUID("12345678-1234-5678-1234-567812345678"),
-        )
-        result = ArrowFrame[ComplexModel].from_rows([m]).collect()
-        assert result == [m]
-
-    def test_models_to_batch_then_batch_to_models(self):
-        """models_to_batch + batch_to_models should round-trip ComplexModel."""
-        instances = [
-            ComplexModel(
-                name="Alice",
-                color=Color.RED,
-                scores={"math": 95},
-                uid=uuid.UUID("11111111-1111-1111-1111-111111111111"),
-            ),
-            ComplexModel(
-                name="Bob",
-                color=Color.BLUE,
-                scores={"science": 88, "history": 72},
-                uid=uuid.UUID("22222222-2222-2222-2222-222222222222"),
-            ),
-        ]
-        schema = model_to_schema(ComplexModel)
-        batch = models_to_batch(instances, schema)
-        result = list(batch_to_models(batch, ComplexModel))
-        assert result == instances
-
-
-class TestDiagnostics:
-    def test_str_enum_model_dump_returns_object(self):
-        """model_dump() returns enum objects (Python mode) — this is the bug source."""
-        m = ModelWithStrEnum(name="x", color=Color.RED)
-        dumped = m.model_dump()
-        # In Python mode, Pydantic preserves the enum object
-        assert isinstance(dumped["color"], Color), (
-            "After fix: model_dump() still returns Color here — fix must be in from_rows, not model_dump"
-        )
-
-    def test_str_enum_model_dump_json_returns_str(self):
-        """model_dump(mode='json') returns the string value — the correct form for Arrow."""
-        m = ModelWithStrEnum(name="x", color=Color.RED)
-        dumped = m.model_dump(mode="json")
-        assert dumped["color"] == "red"  # this is what Arrow expects
-
-    def test_uuid_model_dump_returns_object(self):
-        """model_dump() returns UUID object — this is the bug source for UUIDs."""
-        uid = uuid.UUID("12345678-1234-5678-1234-567812345678")
-        m = ModelWithUUID(id=uid, label="x")
-        dumped = m.model_dump()
-        assert isinstance(dumped["id"], uuid.UUID), (
-            "After fix: model_dump() still returns UUID here — fix must be in from_rows, not model_dump"
-        )
-
-    def test_map_column_to_pylist_returns_tuples(self):
-        """Arrow map<> column returns list-of-tuples from to_pylist() — the bug source."""
+    def test_map_column_raw_format(self):
+        """Document: Arrow map<> deserialises as list-of-tuples from to_pylist()."""
         schema = model_to_schema(ModelWithDict)
         batch = models_to_batch([ModelWithDict(tags={"a": 1})], schema)
         row = batch.to_pylist()[0]
-        # Currently a list of tuples — should become a dict after the fix
-        assert isinstance(row["tags"], list), "map columns give list-of-tuples from to_pylist()"
+        assert isinstance(row["tags"], list)
         assert row["tags"] == [("a", 1)]
 
-    def test_map_column_fix_is_dict_conversion(self):
-        """Manually applying dict() to the list-of-tuples produces correct input for Pydantic."""
+    def test_tuple_to_dict_conversion(self):
+        """Document: dict() applied to the list-of-tuples gives Pydantic-valid input."""
         schema = model_to_schema(ModelWithDict)
         batch = models_to_batch([ModelWithDict(tags={"a": 1, "b": 2})], schema)
-        row = batch.to_pylist()[0]
-        # The fix: convert list-of-tuples → dict
-        fixed: dict[str, Any] = {**row, "tags": dict(row["tags"])}
-        m = ModelWithDict.model_validate(fixed)
-        assert m.tags == {"a": 1, "b": 2}
+        row: dict[str, Any] = batch.to_pylist()[0]
+        fixed = {**row, "tags": dict(row["tags"])}
+        assert ModelWithDict.model_validate(fixed).tags == {"a": 1, "b": 2}
+
+
+# ---------------------------------------------------------------------------
+# TestParquetSchemaMismatch — reading a file with a different model
+# ---------------------------------------------------------------------------
+
+
+class TestParquetSchemaMismatch:
+    """Behaviour when reading a Parquet file with a mismatched Pydantic model.
+
+    Compatible readers succeed; incompatible readers raise ``ValidationError``.
+    """
+
+    @pytest.mark.parametrize(
+        "ReaderModel,check",
+        [
+            pytest.param(
+                ReaderSubset,
+                lambda rows: [r.name for r in rows] == ["Alice", "Bob"],
+                id="subset",
+            ),
+            pytest.param(
+                ReaderOptionalExtra,
+                lambda rows: all(r.country is None for r in rows),
+                id="optional-extra",
+            ),
+        ],
+    )
+    def test_compatible_reader(self, writer_parquet, ReaderModel, check):
+        """Compatible readers return correct data without error."""
+        result = ArrowFrame[ReaderModel].from_parquet(writer_parquet).collect()
+        assert len(result) == 2
+        assert check(result)
+
+    @pytest.mark.parametrize(
+        "ReaderModel,match",
+        [
+            pytest.param(ReaderMissingRequiredField, "country", id="missing-required"),
+            pytest.param(ReaderWrongType, "age", id="type-mismatch"),
+            pytest.param(ReaderTotallyDifferent, "product", id="totally-different"),
+        ],
+    )
+    def test_incompatible_reader_raises(self, writer_parquet, ReaderModel, match):
+        """Incompatible readers raise ValidationError naming the problem field."""
+        with pytest.raises(ValidationError, match=match):
+            ArrowFrame[ReaderModel].from_parquet(writer_parquet).collect()
+
+    def test_explicit_column_projection(self, writer_parquet):
+        """columns= projection lets a subset reader safely ignore extra file columns."""
+        result = ArrowFrame[ReaderSubset].from_parquet(writer_parquet, columns=["name"]).collect()
+        assert [r.name for r in result] == ["Alice", "Bob"]
+
+
+# ---------------------------------------------------------------------------
+# TestDiagnostics — document Arrow / Pydantic internals (no assertions that
+# the lib should change; these explain the root causes of BUG-1 and BUG-2)
+# ---------------------------------------------------------------------------
+
+
+class TestDiagnostics:
+    """Non-regression tests that pin the observed behaviour of underlying libraries.
+
+    They explain *why* the coercion fixes are needed and ensure the assumptions
+    they rely on have not changed in a new library version.
+    """
+
+    @pytest.mark.parametrize(
+        "instance,field,expected_type",
+        [
+            pytest.param(
+                ModelWithStrEnum(name="x", color=Color.RED),
+                "color",
+                Color,
+                id="str-enum",
+            ),
+            pytest.param(
+                ModelWithUUID(id=_FIXED_UUID, label="x"),
+                "id",
+                uuid.UUID,
+                id="uuid",
+            ),
+        ],
+    )
+    def test_model_dump_python_preserves_rich_type(self, instance, field, expected_type):
+        """model_dump() (Python mode) returns the rich object, not a primitive.
+
+        This is expected Pydantic behaviour; our fix is in _frame.py/_convert.py,
+        NOT in how model_dump() is called.
+        """
+        dumped = instance.model_dump()
+        assert isinstance(dumped[field], expected_type)
+
+    @pytest.mark.parametrize(
+        "instance,field,expected_value",
+        [
+            pytest.param(
+                ModelWithStrEnum(name="x", color=Color.RED),
+                "color",
+                "red",
+                id="str-enum",
+            ),
+            pytest.param(
+                ModelWithUUID(id=_FIXED_UUID, label="x"),
+                "id",
+                "12345678-1234-5678-1234-567812345678",
+                id="uuid",
+            ),
+        ],
+    )
+    def test_model_dump_json_serializes_to_primitive(self, instance, field, expected_value):
+        """model_dump(mode='json') returns primitives — the correct form for Arrow."""
+        assert instance.model_dump(mode="json")[field] == expected_value
