@@ -38,7 +38,7 @@ jobs:
           cache-dependency-glob: "pyproject.toml"
 
       - name: Install project + test dependencies
-        run: uv sync --locked --extra test
+        run: uv sync --extra test
 
       - name: Override to minimum dependency versions
         if: matrix.deps == 'min'

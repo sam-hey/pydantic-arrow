@@ -23,7 +23,7 @@ jobs:
           cache-dependency-glob: "pyproject.toml"
 
       - name: Install lint dependencies
-        run: uv sync --locked --extra lint
+        run: uv sync --extra lint
 
       # Cache pre-commit environments keyed by Python version + config hash
       # (recommended approach from https://pre-commit.com/#github-actions-example)
@@ -51,7 +51,7 @@ jobs:
           cache-dependency-glob: "pyproject.toml"
 
       - name: Install lint + test dependencies
-        run: uv sync --locked --extra lint --extra test
+        run: uv sync --extra lint --extra test
 
       - name: Type check
         run: uv run mypy src/

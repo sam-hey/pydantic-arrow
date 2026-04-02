@@ -24,7 +24,7 @@ jobs:
           cache-dependency-glob: "pyproject.toml"
 
       - name: Install project + test dependencies
-        run: uv sync --locked --extra test
+        run: uv sync --extra test
 
       # No -n auto: memray tracks allocations per-process and is incompatible with xdist
       - name: Run memory tests
