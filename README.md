@@ -1,5 +1,12 @@
 # pydantic-arrow
 
+[![Tests](https://github.com/sam-hey/pydantic-arrow/actions/workflows/tests.yml/badge.svg)](https://github.com/sam-hey/pydantic-arrow/actions/workflows/tests.yml)
+[![Lint](https://github.com/sam-hey/pydantic-arrow/actions/workflows/lint.yml/badge.svg)](https://github.com/sam-hey/pydantic-arrow/actions/workflows/lint.yml)
+[![Memory](https://github.com/sam-hey/pydantic-arrow/actions/workflows/memory.yml/badge.svg)](https://github.com/sam-hey/pydantic-arrow/actions/workflows/memory.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://github.com/sam-hey/pydantic-arrow)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 A Pydantic-native lazy Apache Arrow DataFrame wrapper.
 
 Define your data schema once as a Pydantic model and get a fully typed, lazily-evaluated
