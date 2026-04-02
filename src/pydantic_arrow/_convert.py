@@ -23,7 +23,9 @@ def batch_to_models(batch: pa.RecordBatch, model: type[T]) -> Iterator[T]:
     """Yield validated *model* instances from a single :class:`pyarrow.RecordBatch`.
 
     Each row is converted to a Python dict via ``batch.to_pylist()`` and then
-    validated with ``model.model_validate(row)``.
+    validated with ``model.model_validate(row)``.  Arrow ``map<K,V>`` columns
+    deserialise as ``[(key, value), ...]``; these are converted back to plain
+    ``dict`` objects before validation.
 
     Args:
         batch: A PyArrow record batch.
@@ -32,8 +34,9 @@ def batch_to_models(batch: pa.RecordBatch, model: type[T]) -> Iterator[T]:
     Yields:
         Validated model instances, one per row.
     """
+    schema = batch.schema
     for row in batch.to_pylist():
-        yield model.model_validate(row)
+        yield model.model_validate(_fix_arrow_row(row, schema))
 
 
 def models_to_batch(
@@ -98,4 +101,40 @@ def _coerce(value: Any) -> Any:
         return {k: _coerce(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_coerce(v) for v in value]
+    return value
+
+
+def _fix_arrow_row(row: dict[str, Any], schema: pa.Schema) -> dict[str, Any]:
+    """Re-hydrate a row produced by ``RecordBatch.to_pylist()``.
+
+    Arrow ``map<K,V>`` columns deserialise as ``[(key, value), ...]`` rather
+    than ``{key: value}``.  This function walks the schema and converts any
+    such values back to plain Python dicts so Pydantic can validate them.
+    """
+    return {field.name: _fix_arrow_value(row[field.name], field.type) for field in schema}
+
+
+def _fix_arrow_value(value: Any, arrow_type: pa.DataType) -> Any:
+    """Recursively convert Arrow-deserialized values to Python-native equivalents."""
+    if value is None:
+        return None
+    if pa.types.is_map(arrow_type):
+        # map<K,V> -> [(k, v), ...] in to_pylist(); convert to dict
+        if isinstance(value, list):
+            return {k: _fix_arrow_value(v, arrow_type.item_type) for k, v in value}
+        return value
+    if pa.types.is_struct(arrow_type):
+        if isinstance(value, dict):
+            return {
+                arrow_type.field(i).name: _fix_arrow_value(
+                    value[arrow_type.field(i).name],
+                    arrow_type.field(i).type,
+                )
+                for i in range(arrow_type.num_fields)
+            }
+        return value
+    if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
+        if isinstance(value, list):
+            return [_fix_arrow_value(item, arrow_type.value_type) for item in value]
+        return value
     return value

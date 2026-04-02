@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 
 __all__ = [
     "BatchReaderSource",
+    "ConcatSource",
     "LazySource",
     "ParquetSource",
     "RowSource",
@@ -155,6 +156,35 @@ class TableSource:
 
     def iter_batches(self) -> Iterator[pa.RecordBatch]:
         yield from self._table.to_batches(max_chunksize=self._batch_size)
+
+
+# ---------------------------------------------------------------------------
+# ConcatSource
+# ---------------------------------------------------------------------------
+
+
+class ConcatSource:
+    """Lazy source that concatenates multiple sources in sequence.
+
+    Batches from each source are yielded one at a time without materialising
+    any source in full.  All sources must share the same Arrow schema.
+
+    Args:
+        sources: Two or more :class:`LazySource` implementations to chain.
+    """
+
+    def __init__(self, sources: list[LazySource]) -> None:
+        if not sources:
+            raise ValueError("ConcatSource requires at least one source.")
+        self._sources = sources
+
+    @property
+    def schema(self) -> pa.Schema:
+        return self._sources[0].schema
+
+    def iter_batches(self) -> Iterator[pa.RecordBatch]:
+        for source in self._sources:
+            yield from source.iter_batches()
 
 
 # ---------------------------------------------------------------------------
