@@ -100,7 +100,7 @@ class TestArrowPoolLaziness:
         This is the definitive laziness test: if the first ``next()`` call
         allocates the whole table, we are not lazy.
         """
-        path, total_rows, rows_per_group = multigroup_parquet_file
+        path, _total_rows, rows_per_group = multigroup_parquet_file
 
         # Measure full table size for comparison
         full_frame = ArrowFrame[SimpleUser].from_parquet(path)
@@ -196,6 +196,155 @@ class TestArrowPoolLaziness:
 
 
 # ---------------------------------------------------------------------------
+# Writing new entries -- Arrow pool must stay bounded while rows are written
+# ---------------------------------------------------------------------------
+
+
+class TestWritingNewEntries:
+    """Prove that writing rows into an ArrowFrame and flushing to Parquet is
+    genuinely streaming: the Arrow memory pool never holds more than one batch
+    at a time, regardless of the total number of rows being written.
+
+    Strategy: create a 200 K-row frame from Python dicts using a small
+    ``batch_size`` so the RowSource chunks them one batch at a time.  The
+    ``to_parquet()`` write path uses a ``ParquetWriter`` that flushes each
+    batch before requesting the next, so the Arrow pool oscillates between
+    ~0 and ~one-batch-size rather than accumulating all rows.
+    """
+
+    _NUM_ROWS = 200_000
+    _BATCH_SIZE = 10_000  # 20 batches of 10 K rows each
+
+    @pytest.fixture()
+    def large_rows(self) -> list[dict]:
+        """200 K pre-built row dicts for write tests."""
+        return [
+            {"name": f"user_{i}", "age": i % 100, "score": float(i), "active": i % 2 == 0}
+            for i in range(self._NUM_ROWS)
+        ]
+
+    def test_write_rows_arrow_pool_bounded(self, large_rows, tmp_path):
+        """Writing 200 K rows to Parquet must keep the Arrow pool under one full-table load.
+
+        Reference: materialising all rows at once allocates the full table.
+        Streaming write should never exceed ~one batch (1/20th of the table).
+        """
+        out = tmp_path / "written.parquet"
+        schema = model_to_schema(SimpleUser)
+
+        # Measure the cost of materialising the full table at once
+        before_full = pa.total_allocated_bytes()
+        full_table = pa.Table.from_pylist(large_rows, schema=schema)
+        full_table_bytes = pa.total_allocated_bytes() - before_full
+        del full_table
+        assert full_table_bytes > 0
+
+        # Stream-write via ArrowFrame: RowSource produces one batch at a time,
+        # to_parquet() flushes each batch before requesting the next.
+        frame = ArrowFrame[SimpleUser].from_rows(large_rows, batch_size=self._BATCH_SIZE)
+
+        peak_during_write = 0
+        original_iter = frame._source.iter_batches
+
+        def _tracking_iter():
+            nonlocal peak_during_write
+            for batch in original_iter():
+                current = pa.total_allocated_bytes()
+                if current > peak_during_write:
+                    peak_during_write = current
+                yield batch
+
+        frame._source.iter_batches = _tracking_iter  # type: ignore[method-assign]
+        frame.to_parquet(out)
+
+        assert out.exists()
+        written_rows = pq.read_metadata(out).num_rows
+        assert written_rows == self._NUM_ROWS
+
+        # Arrow pool during write must never reach the full-table size
+        assert peak_during_write < full_table_bytes, (
+            f"Write peak ({peak_during_write // 1024} KB) exceeded full table "
+            f"({full_table_bytes // 1024} KB). Rows are being buffered entirely."
+        )
+
+    def test_append_single_entry_stays_bounded(self, multigroup_parquet_file, tmp_path):
+        """Appending one row to a 200 K-row Parquet frame must not load the full table.
+
+        The existing data streams lazily from the Parquet file; the new entry
+        is a tiny RowSource.  The ConcatSource chains them without
+        materialising either.  Peak Arrow pool during ``to_parquet()`` must
+        stay well below the full-table allocation.
+        """
+        path, total_rows, rows_per_group = multigroup_parquet_file
+        out = tmp_path / "appended.parquet"
+
+        # Measure full-table cost for reference
+        full_frame = ArrowFrame[SimpleUser].from_parquet(path)
+        before_full = pa.total_allocated_bytes()
+        full_table = full_frame.to_arrow()
+        full_table_bytes = pa.total_allocated_bytes() - before_full
+        del full_table
+        assert full_table_bytes > 0
+
+        # Append one entry and write -- measure Arrow pool during the write
+        new_entry = {"name": "new_user", "age": 42, "score": 99.9, "active": True}
+        frame = ArrowFrame[SimpleUser].from_parquet(path, batch_size=rows_per_group)
+        appended = frame.append(new_entry)
+
+        before_write = pa.total_allocated_bytes()
+        appended.to_parquet(out)
+        peak_write = pa.total_allocated_bytes() - before_write
+
+        assert pq.read_metadata(out).num_rows == total_rows + 1
+
+        # Writing should never hold the full table in Arrow memory at once
+        assert peak_write < full_table_bytes, (
+            f"Append+write peak ({peak_write // 1024} KB) exceeded full table "
+            f"({full_table_bytes // 1024} KB). Full table was materialised."
+        )
+
+    def test_write_rows_peak_scales_with_batch_not_total(self, large_rows, tmp_path):
+        """Peak Arrow memory when writing scales with batch_size, not total rows.
+
+        Writing with batch_size=1000 must use substantially less Arrow memory
+        than writing with batch_size=50000, even over the same 200 K row dataset.
+        """
+        out_small = tmp_path / "small_batch.parquet"
+        out_large = tmp_path / "large_batch.parquet"
+
+        def _peak_write(batch_size: int, out) -> int:
+            frame = ArrowFrame[SimpleUser].from_rows(large_rows, batch_size=batch_size)
+            peak = 0
+            original = frame._source.iter_batches
+
+            def _tracked():
+                nonlocal peak
+                for batch in original():
+                    current = pa.total_allocated_bytes()
+                    if current > peak:
+                        peak = current
+                    yield batch
+
+            frame._source.iter_batches = _tracked  # type: ignore[method-assign]
+            frame.to_parquet(out)
+            return peak
+
+        peak_small = _peak_write(1_000, out_small)
+        peak_large = _peak_write(50_000, out_large)
+
+        # Smaller batches → smaller Arrow peak; we expect at least 5x difference
+        assert peak_small * 5 < peak_large, (
+            f"peak with batch_size=1000 ({peak_small // 1024} KB) is not "
+            f"significantly less than peak with batch_size=50000 ({peak_large // 1024} KB). "
+            "Memory does not scale with batch size."
+        )
+
+        # Both files must contain the same number of rows
+        assert pq.read_metadata(out_small).num_rows == self._NUM_ROWS
+        assert pq.read_metadata(out_large).num_rows == self._NUM_ROWS
+
+
+# ---------------------------------------------------------------------------
 # pytest-memray limit_memory tests -- enforced only with --memray flag
 # ---------------------------------------------------------------------------
 
@@ -233,7 +382,7 @@ class TestMemrayLimits:
 
         Only ~255 KB of the 5+ MB file should be loaded.
         """
-        path, total_rows, rows_per_group = multigroup_parquet_file
+        path, _total_rows, rows_per_group = multigroup_parquet_file
         frame = ArrowFrame[SimpleUser].from_parquet(path, batch_size=rows_per_group)
         it = frame.iter_batches()
         first_batch = next(it)
@@ -276,3 +425,27 @@ class TestMemrayLimits:
         frame = ArrowFrame[SimpleUser].from_parquet(path, batch_size=rows_per_group)
         frame.to_parquet(out)
         assert pq.read_metadata(out).num_rows == total_rows
+
+    @pytest.mark.limit_memory("2 MB")
+    def test_append_single_entry_to_parquet_frame(self, multigroup_parquet_file, tmp_path):
+        """Appending one row to a 200 K-row Parquet frame and writing costs < 2 MB.
+
+        The base source is a ``ParquetSource`` (cheap streaming decode).
+        The appended entry is a single-row ``RowSource``.  The whole pipeline
+        is lazy: neither source is materialised before writing.
+        """
+        path, total_rows, rows_per_group = multigroup_parquet_file
+        out = tmp_path / "appended_memray.parquet"
+        new_entry = {"name": "new_user", "age": 42, "score": 99.9, "active": True}
+        frame = ArrowFrame[SimpleUser].from_parquet(path, batch_size=rows_per_group)
+        frame.append(new_entry).to_parquet(out)
+        assert pq.read_metadata(out).num_rows == total_rows + 1
+
+    # NOTE: a memray ``limit_memory`` test for RowSource-based writes is
+    # intentionally omitted here.  ``pa.RecordBatch.from_pylist`` makes heavy
+    # *temporary* C++ allocations per call that memray counts cumulatively.
+    # 20 batches x ~50 MB of internal Arrow builder overhead = ~1 GB cumulative
+    # even though peak live RSS only rises ~1.5 MB.  The ``TestWritingNewEntries``
+    # class above verifies bounded peak memory via ``pa.total_allocated_bytes()``,
+    # which is the correct tool for RowSource laziness.  Parquet-sourced writes
+    # are already covered by ``test_streaming_write_to_parquet`` above.

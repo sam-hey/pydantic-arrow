@@ -10,10 +10,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel
 
-from pydantic_arrow._convert import batch_to_models
+from pydantic_arrow._convert import _to_dict, batch_to_models
 from pydantic_arrow._schema import model_to_schema
 from pydantic_arrow._sources import (
     BatchReaderSource,
+    ConcatSource,
     LazySource,
     ParquetSource,
     RowSource,
@@ -25,6 +26,22 @@ __all__ = ["ArrowFrame"]
 T = TypeVar("T", bound=BaseModel)
 
 _BATCH_SIZE = 65_536
+
+
+def _count_source_rows(source: LazySource) -> int:
+    """Recursively count rows for sources that support it.
+
+    Supports :class:`TableSource`, :class:`RowSource`, and
+    :class:`ConcatSource` (by summing sub-sources).  Raises
+    :class:`TypeError` for one-shot streaming sources.
+    """
+    if isinstance(source, TableSource):
+        return int(source._table.num_rows)
+    if isinstance(source, RowSource):
+        return len(source._rows)
+    if isinstance(source, ConcatSource):
+        return sum(_count_source_rows(s) for s in source._sources)
+    raise TypeError("num_rows is not available for streaming sources. Use collect() to materialise first.")
 
 
 class ArrowFrame(Generic[T]):
@@ -98,7 +115,7 @@ class ArrowFrame(Generic[T]):
         """
         model = cls._require_model()
         schema = model_to_schema(model)
-        normalised = [r.model_dump() if isinstance(r, BaseModel) else dict(r) for r in rows]
+        normalised = [_to_dict(r) for r in rows]
         source = RowSource(normalised, schema, batch_size=batch_size)
         return cls(source)
 
@@ -152,6 +169,95 @@ class ArrowFrame(Generic[T]):
             source = TableSource(data, batch_size=batch_size)
         return cls(source)
 
+    def append(
+        self,
+        rows: list[dict[str, Any] | BaseModel] | dict[str, Any] | BaseModel,
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> ArrowFrame[Any]:
+        """Return a new frame with *rows* appended after the existing data.
+
+        Neither the existing frame nor the new rows are loaded into memory
+        until iteration begins.  The result is backed by a :class:`ConcatSource`
+        that chains the original source with a :class:`RowSource` for *rows*.
+
+        A single dict or model instance is accepted as well as a list.
+
+        Args:
+            rows: One or more dicts or ``BaseModel`` instances to append.
+            batch_size: Batch size for the new :class:`RowSource`.
+
+        Returns:
+            A new :class:`ArrowFrame` of the same type.
+        """
+        if isinstance(rows, dict | BaseModel):
+            rows = [rows]
+        model = self._require_model()
+        schema = model_to_schema(model)
+        normalised = [_to_dict(r) for r in rows]
+        extra = RowSource(normalised, schema, batch_size=batch_size)
+        return type(self)(ConcatSource([self._source, extra]))
+
+    def extend(
+        self,
+        rows: list[dict[str, Any] | BaseModel],
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> None:
+        """Extend this frame **in place** with additional rows.
+
+        Equivalent to ``my_list.extend([...])``.  The existing source is
+        chained with a new :class:`RowSource` via :class:`ConcatSource`; no
+        data is loaded until the next iteration.
+
+        Args:
+            rows: A list of dicts or ``BaseModel`` instances to append.
+            batch_size: Batch size for the new :class:`RowSource`.
+        """
+        model = self._require_model()
+        schema = model_to_schema(model)
+        normalised = [_to_dict(r) for r in rows]
+        extra = RowSource(normalised, schema, batch_size=batch_size)
+        self._source = ConcatSource([self._source, extra])
+
+    def __add__(
+        self,
+        other: ArrowFrame[Any] | list[dict[str, Any] | BaseModel],
+    ) -> ArrowFrame[Any]:
+        """Return a new frame that is the concatenation of this frame and *other*.
+
+        Equivalent to ``new_frame = frame + rows`` or ``new_frame = frame + other_frame``.
+
+        Args:
+            other: Another :class:`ArrowFrame` or a list of dicts / model instances.
+
+        Returns:
+            A new :class:`ArrowFrame` backed by a :class:`ConcatSource`.
+        """
+        if isinstance(other, ArrowFrame):
+            return type(self)(ConcatSource([self._source, other._source]))
+        return self.append(other)
+
+    def __iadd__(
+        self,
+        other: ArrowFrame[Any] | list[dict[str, Any] | BaseModel],
+    ) -> ArrowFrame[Any]:
+        """Extend this frame **in place** and return ``self``.
+
+        Equivalent to ``frame += rows`` or ``frame += other_frame``.
+
+        Args:
+            other: Another :class:`ArrowFrame` or a list of dicts / model instances.
+
+        Returns:
+            ``self`` after the in-place extension.
+        """
+        if isinstance(other, ArrowFrame):
+            self._source = ConcatSource([self._source, other._source])
+        else:
+            self.extend(other)
+        return self
+
     # ------------------------------------------------------------------
     # Schema / metadata
     # ------------------------------------------------------------------
@@ -165,14 +271,11 @@ class ArrowFrame(Generic[T]):
     def num_rows(self) -> int:
         """Total row count.
 
-        Only available for :class:`TableSource` and :class:`RowSource`-backed
-        frames.  Raises :class:`TypeError` for streaming sources.
+        Supported for :class:`TableSource`, :class:`RowSource`, and any
+        :class:`ConcatSource` whose sub-sources all support it.
+        Raises :class:`TypeError` for one-shot streaming sources.
         """
-        if isinstance(self._source, TableSource):
-            return int(self._source._table.num_rows)
-        if isinstance(self._source, RowSource):
-            return len(self._source._rows)
-        raise TypeError("num_rows is not available for streaming sources. Use collect() to materialise first.")
+        return _count_source_rows(self._source)
 
     # ------------------------------------------------------------------
     # Lazy iteration
