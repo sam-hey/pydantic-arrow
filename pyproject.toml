@@ -1,6 +1,6 @@
 [project]
 name = "pydantic-arrow"
-version = "1.0.0"
+version = "1.0.1"
 description = "Pydantic-native lazy Apache Arrow DataFrame wrapper"
 readme = "README.md"
 authors = [
