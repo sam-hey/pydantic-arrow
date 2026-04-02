@@ -1,0 +1,31 @@
+name: Memory
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  memory:
+    name: "Memory Tests (py3.13)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-uv@v7: installs uv, pins Python version, enables built-in caching
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Install project + test dependencies
+        run: uv sync --extra test
+
+      # No -n auto: memray tracks allocations per-process and is incompatible with xdist
+      - name: Run memory tests
+        run: uv run pytest tests/test_memory.py --memray -v
