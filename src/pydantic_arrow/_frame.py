@@ -52,7 +52,7 @@ class ArrowFrame(Generic[T]):
 
     __model__: ClassVar[type[BaseModel]]
 
-    def __class_getitem__(cls, model: Any) -> type[ArrowFrame[Any]]:  # type: ignore[override]
+    def __class_getitem__(cls, model: Any) -> type[ArrowFrame[Any]]:
         """Bind a Pydantic model to this frame class.
 
         When *model* is a concrete ``BaseModel`` subclass we create a new
@@ -68,7 +68,7 @@ class ArrowFrame(Generic[T]):
                 (cls,),
                 {"__model__": model},
             )
-        return super().__class_getitem__(model)  # type: ignore[return-value]
+        return super().__class_getitem__(model)  # type: ignore[misc, no-any-return]
 
     # ------------------------------------------------------------------
     # Construction
@@ -169,7 +169,7 @@ class ArrowFrame(Generic[T]):
         frames.  Raises :class:`TypeError` for streaming sources.
         """
         if isinstance(self._source, TableSource):
-            return self._source._table.num_rows
+            return int(self._source._table.num_rows)
         if isinstance(self._source, RowSource):
             return len(self._source._rows)
         raise TypeError("num_rows is not available for streaming sources. Use collect() to materialise first.")
@@ -276,13 +276,13 @@ class ArrowFrame(Generic[T]):
 
     @classmethod
     def _require_model(cls) -> type[BaseModel]:
-        model = getattr(cls, "__model__", None)
+        model: type[BaseModel] | None = getattr(cls, "__model__", None)
         if model is None:
             raise TypeError(
                 "ArrowFrame must be parameterised with a Pydantic model. "
                 "Use ArrowFrame[MyModel].from_rows(...) instead of ArrowFrame.from_rows(...)."
             )
-        return model  # type: ignore[return-value]
+        return model
 
     def __repr__(self) -> str:
         model = getattr(self.__class__, "__model__", None)

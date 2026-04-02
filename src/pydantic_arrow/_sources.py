@@ -116,7 +116,7 @@ class ParquetSource:
     def schema(self) -> pa.Schema:
         pf = self._open()
         if self._columns:
-            return pf.schema_arrow.field(self._columns[0]).type  # type: ignore[return-value]
+            return pf.schema_arrow.field(self._columns[0]).type
         return pf.schema_arrow
 
     @property
