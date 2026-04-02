@@ -1,31 +1,34 @@
 name: Release
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Tests"]   # must match the `name:` in tests.yml exactly
+    types: [completed]
     branches: [main]
 
 jobs:
   release:
     name: Semantic Release
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     concurrency:
       group: release
-      cancel-in-progress: false   # never cancel a release in flight
+      cancel-in-progress: false  # never cancel a release in flight
     permissions:
-      contents: write             # push version bump commit + tag
-      id-token: write             # needed by PSR for GitHub release
+      contents: write            # push version bump commit + tag
+      id-token: write            # needed by PSR for GitHub release
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # PSR needs full history to find last tag
+          fetch-depth: 0         # PSR needs full history to find last tag
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: python-semantic-release/python-semantic-release@v10
         id: release
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          build: "false"          # we build in the publish job
-          changelog: "false"      # no CHANGELOG.md; release notes go into GitHub Release only
+          build: "false"         # we build in the publish job
+          changelog: "false"     # release notes go into GitHub Release only
     outputs:
       released: ${{ steps.release.outputs.released }}
       tag: ${{ steps.release.outputs.tag }}
@@ -39,7 +42,7 @@ jobs:
       name: pypi
       url: https://pypi.org/project/pydantic-arrow/
     permissions:
-      id-token: write             # OIDC token for Trusted Publishing
+      id-token: write            # OIDC token for Trusted Publishing
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,6 +56,4 @@ jobs:
         run: uv build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          print-hash: true
+        run: uv publish

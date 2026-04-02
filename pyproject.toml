@@ -63,5 +63,4 @@ relative_files = true
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
-changelog = false           # no CHANGELOG.md; release notes live only in the GitHub Release
 build_command = ""          # building is handled in the publish job
