@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import typing
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
-from typing import Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 from uuid import UUID
 
 import pyarrow as pa
@@ -42,6 +42,17 @@ def python_type_to_arrow(annotation: Any, field_info: FieldInfo | None = None) -
 def _resolve(annotation: Any, *, field_info: FieldInfo | None, nullable: bool) -> tuple[pa.DataType, bool]:
     """Recursively resolve a type annotation to (pa.DataType, nullable)."""
 
+    # --- Annotated[T, ...] — check for a pa.DataType override first ---------
+    # get_origin(Annotated[T, ...]) returns the bare `Annotated` class, so
+    # comparing with `is Annotated` is the clearest way to detect this form.
+    if get_origin(annotation) is Annotated:
+        base, *metadata = get_args(annotation)
+        for meta in metadata:
+            if isinstance(meta, pa.DataType):
+                return meta, nullable
+        # No pa.DataType found in metadata; fall through with the base type
+        return _resolve(base, field_info=field_info, nullable=nullable)
+
     # --- Union / Optional ---------------------------------------------------
     origin = get_origin(annotation)
     if origin is not None and is_union_origin(origin):
@@ -70,6 +81,12 @@ def _resolve(annotation: Any, *, field_info: FieldInfo | None, nullable: bool) -
 
     # --- list[T] ------------------------------------------------------------
     if origin is list:
+        (inner_args,) = get_args(annotation) or (Any,)
+        inner_dtype, _ = _resolve(inner_args, field_info=None, nullable=False)
+        return pa.list_(inner_dtype), nullable
+
+    # --- frozenset[T] → pa.list_(T) — Arrow has no native set type ----------
+    if origin is frozenset:
         (inner_args,) = get_args(annotation) or (Any,)
         inner_dtype, _ = _resolve(inner_args, field_info=None, nullable=False)
         return pa.list_(inner_dtype), nullable
@@ -105,6 +122,8 @@ def _scalar_to_arrow(tp: Any, *, field_info: FieldInfo | None, nullable: bool) -
         return pa.date32(), nullable
     if tp is time:
         return pa.time64("us"), nullable
+    if tp is timedelta:
+        return pa.duration("us"), nullable
     if tp is UUID:
         return pa.utf8(), nullable  # stored as canonical UUID string
     if tp is Decimal:

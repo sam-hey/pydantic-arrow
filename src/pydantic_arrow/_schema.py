@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import typing
 
 import pyarrow as pa
 from pydantic import BaseModel
 
 from pydantic_arrow._types import python_type_to_arrow
-
-if TYPE_CHECKING:
-    pass
 
 __all__ = ["model_to_schema"]
 
@@ -33,9 +30,22 @@ def model_to_schema(model: type[BaseModel]) -> pa.Schema:
 
 def _fields_to_arrow_fields(model: type[BaseModel]) -> list[pa.Field]:
     """Return a list of :class:`pyarrow.Field` objects for *model*'s fields."""
+    # get_type_hints with include_extras=True resolves string annotations (from
+    # `from __future__ import annotations`) and preserves Annotated[T, ...] metadata.
+    # Pydantic strips Annotated in field_info.annotation, so we always prefer
+    # the resolved hint for accurate Arrow type mapping.
+    try:
+        resolved = typing.get_type_hints(model, include_extras=True)
+    except Exception:
+        resolved = {}
+
     arrow_fields: list[pa.Field] = []
     for name, field_info in model.model_fields.items():
-        annotation = field_info.annotation
+        # Fields marked exclude=True are omitted from model_dump(), so there is
+        # no data to store in Arrow.  Skip them to keep the schema consistent.
+        if field_info.exclude:
+            continue
+        annotation = resolved.get(name, field_info.annotation)
         if annotation is None:
             raise TypeError(f"Field '{name}' on {model.__name__} has no type annotation.")
 

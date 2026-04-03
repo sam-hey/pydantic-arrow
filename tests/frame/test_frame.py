@@ -9,7 +9,7 @@ from dirty_equals import IsInstance
 from inline_snapshot import snapshot
 from pydantic import BaseModel
 
-from pydantic_arrow import ArrowFrame, model_to_schema
+from pydantic_arrow import ArrowFrame, model_to_schema, rows_to_batches
 from tests.conftest import SimpleUser
 
 # ---------------------------------------------------------------------------
@@ -161,6 +161,11 @@ class TestIndexing:
         with pytest.raises(ValueError, match="step != 1"):
             frame[::2]
 
+    def test_out_of_range_index_raises(self, simple_rows):
+        frame = ArrowFrame[SimpleUser].from_rows(simple_rows)
+        with pytest.raises(IndexError, match="out of range"):
+            frame[999]
+
 
 # ---------------------------------------------------------------------------
 # num_rows
@@ -178,10 +183,9 @@ class TestNumRows:
         frame = ArrowFrame[SimpleUser].from_arrow(table)
         assert frame.num_rows == len(simple_rows)
 
-    def test_parquet_source_raises(self, parquet_file):
+    def test_parquet_source_returns_row_count(self, parquet_file):
         frame = ArrowFrame[SimpleUser].from_parquet(parquet_file)
-        with pytest.raises(TypeError, match="not available for streaming"):
-            _ = frame.num_rows
+        assert frame.num_rows == 3  # parquet_file fixture has 3 rows
 
     def test_len_matches_num_rows(self, simple_rows):
         frame = ArrowFrame[SimpleUser].from_rows(simple_rows)
@@ -548,6 +552,30 @@ class TestPlainEnumRoundtrip:
         frame.extend([Paint(color=Color.BLUE)])
         colors = [p.color for p in frame]
         assert colors == [Color.RED, Color.BLUE]
+
+
+class TestRowsToBatches:
+    """Tests for the public rows_to_batches() utility."""
+
+    def test_single_batch_when_rows_fit(self):
+        schema = pa.schema([pa.field("x", pa.int64())])
+        rows = [{"x": i} for i in range(5)]
+        batches = list(rows_to_batches(rows, schema, batch_size=100))
+        assert len(batches) == 1
+        assert batches[0].num_rows == 5
+
+    def test_multiple_batches_when_chunked(self):
+        schema = pa.schema([pa.field("x", pa.int64())])
+        rows = [{"x": i} for i in range(10)]
+        batches = list(rows_to_batches(rows, schema, batch_size=3))
+        # 10 rows in chunks of 3 → 3+3+3+1 = 4 batches
+        assert len(batches) == 4
+        assert sum(b.num_rows for b in batches) == 10
+
+    def test_empty_rows_yields_nothing(self):
+        schema = pa.schema([pa.field("x", pa.int64())])
+        batches = list(rows_to_batches([], schema))
+        assert batches == []
 
 
 class TestNestedModel:

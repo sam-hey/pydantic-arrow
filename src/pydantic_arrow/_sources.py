@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pydantic import BaseModel
+
+from pydantic_arrow._convert import _to_dict
 
 __all__ = [
     "BatchReaderSource",
     "ConcatSource",
+    "GeneratorSource",
     "LazySource",
     "ParquetSource",
     "RowSource",
@@ -111,19 +115,26 @@ class ParquetSource:
         self._pf: pq.ParquetFile | None = None
 
     def _open(self) -> pq.ParquetFile:
-        return pq.ParquetFile(self._path)
+        if self._pf is None:
+            self._pf = pq.ParquetFile(self._path)
+        return self._pf
 
     @property
     def schema(self) -> pa.Schema:
         pf = self._open()
         if self._columns:
-            return pf.schema_arrow.field(self._columns[0]).type
+            full = pf.schema_arrow
+            return pa.schema([full.field(name) for name in self._columns])
         return pf.schema_arrow
 
     @property
     def arrow_schema(self) -> pa.Schema:
         pf = self._open()
         return pf.schema_arrow
+
+    def num_rows(self) -> int:
+        """Return the total row count from Parquet file footer metadata (O(1))."""
+        return int(self._open().metadata.num_rows)
 
     def iter_batches(self) -> Iterator[pa.RecordBatch]:
         pf = self._open()
@@ -216,3 +227,57 @@ class BatchReaderSource:
             return
         self._exhausted = True
         yield from self._reader
+
+
+# ---------------------------------------------------------------------------
+# GeneratorSource
+# ---------------------------------------------------------------------------
+
+
+class GeneratorSource:
+    """One-shot lazy source that validates and batches an unbounded iterable of dicts.
+
+    Accepts any :class:`~collections.abc.Iterable` of plain ``dict`` objects.
+    :meth:`model.model_validate` is called on each dict inside
+    :meth:`iter_batches` before the row is encoded into an Arrow batch — the
+    caller never needs to perform validation manually.
+
+    .. warning::
+        This source is **not** replayable.  Once the iterable is exhausted a
+        second call to :meth:`iter_batches` yields nothing (same contract as
+        :class:`BatchReaderSource`).
+
+    Args:
+        rows: Any iterable of plain ``dict`` objects (e.g. a DB cursor generator).
+        model: The Pydantic model class used to validate each row.
+        schema: The Arrow schema to cast each batch to.
+        batch_size: Maximum rows per :class:`pyarrow.RecordBatch`.
+    """
+
+    def __init__(
+        self,
+        rows: Iterable[dict[str, Any]],
+        model: type[BaseModel],
+        schema: pa.Schema,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+    ) -> None:
+        self._iter = iter(rows)
+        self._model = model
+        self._schema = schema
+        self._batch_size = batch_size
+        self._exhausted = False
+
+    @property
+    def schema(self) -> pa.Schema:
+        return self._schema
+
+    def iter_batches(self) -> Iterator[pa.RecordBatch]:
+        if self._exhausted:
+            return
+        self._exhausted = True
+        while True:
+            chunk = list(itertools.islice(self._iter, self._batch_size))
+            if not chunk:
+                break
+            validated = [_to_dict(self._model.model_validate(row)) for row in chunk]
+            yield pa.RecordBatch.from_pylist(validated, schema=self._schema)

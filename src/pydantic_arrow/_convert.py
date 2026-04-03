@@ -97,6 +97,8 @@ def _coerce(value: Any) -> Any:
         return value.value
     if isinstance(value, Decimal):
         return value  # pyarrow handles Decimal natively with decimal128 schema
+    if isinstance(value, frozenset):
+        return [_coerce(v) for v in value]
     if isinstance(value, dict):
         return {k: _coerce(v) for k, v in value.items()}
     if isinstance(value, list):

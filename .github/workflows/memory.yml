@@ -28,4 +28,4 @@ jobs:
 
       # No -n auto: memray tracks allocations per-process and is incompatible with xdist
       - name: Run memory tests
-        run: uv run pytest tests/test_memory.py --memray -v
+        run: uv run pytest tests/memory/ --memray -v

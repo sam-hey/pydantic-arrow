@@ -150,6 +150,14 @@ def test_literal_mixed_raises():
         python_type_to_arrow(Literal["a", 1])
 
 
+def test_any_maps_to_large_binary():
+    import typing
+
+    dtype, nullable = python_type_to_arrow(typing.Any)
+    assert dtype == pa.large_binary()
+    assert nullable is False
+
+
 # ---------------------------------------------------------------------------
 # Enum
 # ---------------------------------------------------------------------------

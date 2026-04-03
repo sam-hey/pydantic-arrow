@@ -5,6 +5,7 @@ from pydantic_arrow._frame import ArrowFrame
 from pydantic_arrow._schema import model_to_schema
 from pydantic_arrow._sources import (
     BatchReaderSource,
+    GeneratorSource,
     LazySource,
     ParquetSource,
     RowSource,
@@ -15,6 +16,7 @@ from pydantic_arrow._types import python_type_to_arrow
 __all__ = [
     "ArrowFrame",
     "BatchReaderSource",
+    "GeneratorSource",
     # sources
     "LazySource",
     "ParquetSource",
