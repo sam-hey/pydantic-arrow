@@ -7,6 +7,7 @@ import pytest
 
 from pydantic_arrow._sources import (
     BatchReaderSource,
+    ConcatSource,
     ParquetSource,
     RowSource,
     TableSource,
@@ -139,3 +140,36 @@ class TestParquetSource:
         assert first_batch.num_rows <= 1000
         # Don't consume the rest -- verify no error on early exit
         del it
+
+    def test_arrow_schema_returns_full_unfiltered_schema(self, parquet_file):
+        """arrow_schema always returns the raw file schema, ignoring column filters."""
+        source = ParquetSource(parquet_file, columns=["name"])
+        # .schema filters to the selected columns; .arrow_schema returns everything
+        assert len(source.schema.names) == 1
+        assert len(source.arrow_schema.names) > 1
+
+
+# ---------------------------------------------------------------------------
+# ConcatSource
+# ---------------------------------------------------------------------------
+
+
+class TestConcatSource:
+    @pytest.fixture
+    def two_sources(self):
+        s1 = RowSource(ROWS[:5], SCHEMA)
+        s2 = RowSource(ROWS[5:], SCHEMA)
+        return ConcatSource([s1, s2])
+
+    def test_schema_from_first_source(self, two_sources):
+        assert two_sources.schema == SCHEMA
+
+    def test_yields_all_rows(self, two_sources):
+        batches = list(two_sources.iter_batches())
+        total = sum(b.num_rows for b in batches)
+        assert total == len(ROWS)
+
+    def test_empty_sources_raises(self):
+        """ConcatSource with an empty list must raise ValueError immediately."""
+        with pytest.raises(ValueError, match="at least one source"):
+            ConcatSource([])

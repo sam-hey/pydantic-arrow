@@ -1,7 +1,7 @@
 [project]
 name = "pydantic-arrow"
 version = "1.0.2"
-description = "Pydantic-native lazy Apache Arrow DataFrame wrapper"
+description = "Pydantic-native Apache Arrow DataFrame wrapper"
 readme = "README.md"
 authors = [
     { name = "sam-hey", email = "40773225+sam-hey@users.noreply.github.com" }
@@ -59,6 +59,9 @@ format-command = "ruff format --stdin-filename {filename}"
 [tool.coverage.run]
 source = ["src"]
 relative_files = true
+
+[tool.coverage.report]
+fail_under = 90
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

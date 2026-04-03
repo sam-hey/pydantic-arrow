@@ -144,27 +144,16 @@ print(model_to_schema(User))
 
 ```bash
 # Install all dev dependencies
-uv sync --extra test --extra lint
+make install
 
 # Run tests
-pytest
+make test
 
 # Run tests in parallel
 pytest -n auto
 
-# Run with memory profiling enforced (requires --memray)
-pytest tests/test_memory.py --memray -v
-
 # Auto-fill/update inline snapshots
 pytest --inline-snapshot=fix
-
-# Lint
-ruff check src tests
-ruff format src tests
-mypy src
-
-# Install pre-commit hooks
-pre-commit install
 ```
 
 ## Memory guarantees

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, ClassVar, Generic, TypeVar, overload
 
 import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.feather as feather
+import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 from pydantic import BaseModel
 
@@ -15,6 +18,7 @@ from pydantic_arrow._schema import model_to_schema
 from pydantic_arrow._sources import (
     BatchReaderSource,
     ConcatSource,
+    GeneratorSource,
     LazySource,
     ParquetSource,
     RowSource,
@@ -31,14 +35,16 @@ _BATCH_SIZE = 65_536
 def _count_source_rows(source: LazySource) -> int:
     """Recursively count rows for sources that support it.
 
-    Supports :class:`TableSource`, :class:`RowSource`, and
-    :class:`ConcatSource` (by summing sub-sources).  Raises
-    :class:`TypeError` for one-shot streaming sources.
+    Supports :class:`TableSource`, :class:`RowSource`, :class:`ParquetSource`
+    (via file footer metadata), and :class:`ConcatSource` (by summing
+    sub-sources).  Raises :class:`TypeError` for one-shot streaming sources.
     """
     if isinstance(source, TableSource):
         return int(source._table.num_rows)
     if isinstance(source, RowSource):
         return len(source._rows)
+    if isinstance(source, ParquetSource):
+        return source.num_rows()
     if isinstance(source, ConcatSource):
         return sum(_count_source_rows(s) for s in source._sources)
     raise TypeError("num_rows is not available for streaming sources. Use collect() to materialise first.")
@@ -115,7 +121,10 @@ class ArrowFrame(Generic[T]):
         """
         model = cls._require_model()
         schema = model_to_schema(model)
-        normalised = [_to_dict(r) for r in rows]
+        # Validate each row through the model before serialising.  This applies
+        # Pydantic default values for fields that are absent from a partial dict,
+        # ensuring non-nullable Arrow columns are never populated with null.
+        normalised = [_to_dict(r if isinstance(r, BaseModel) else model.model_validate(r)) for r in rows]
         source = RowSource(normalised, schema, batch_size=batch_size)
         return cls(source)
 
@@ -168,6 +177,131 @@ class ArrowFrame(Generic[T]):
         else:
             source = TableSource(data, batch_size=batch_size)
         return cls(source)
+
+    @classmethod
+    def from_iterable(
+        cls,
+        rows: Iterable[dict[str, Any]],
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> ArrowFrame[Any]:
+        """Create a one-shot lazy frame from an unbounded iterable of plain dicts.
+
+        Each dict is validated with ``model.model_validate(row)`` inside the
+        source at iteration time — the caller does not need to perform
+        validation.
+
+        .. warning::
+            This source is **not** replayable.  Once the iterable is exhausted
+            a second iteration yields nothing.
+
+        Args:
+            rows: Any iterable of plain ``dict`` objects (e.g. a DB cursor
+                  generator expression).
+            batch_size: Maximum rows per record batch.
+
+        Returns:
+            A new :class:`ArrowFrame` backed by a :class:`GeneratorSource`.
+        """
+        model = cls._require_model()
+        schema = model_to_schema(model)
+        source = GeneratorSource(rows, model, schema, batch_size=batch_size)
+        return cls(source)
+
+    @classmethod
+    def from_csv(
+        cls,
+        path: str | Path,
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> ArrowFrame[Any]:
+        """Create a lazy frame from a CSV file.
+
+        The CSV is read lazily; Arrow infers column types from the file content.
+
+        Args:
+            path: Path to the CSV file.
+            batch_size: Maximum rows per batch.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        import pyarrow.csv as pa_csv
+
+        cls._require_model()
+        table = pa_csv.read_csv(str(path))
+        source = TableSource(table, batch_size=batch_size)
+        return cls(source)
+
+    @classmethod
+    def from_json(
+        cls,
+        path: str | Path,
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> ArrowFrame[Any]:
+        """Create a lazy frame from a newline-delimited JSON file.
+
+        Args:
+            path: Path to the JSON Lines file.
+            batch_size: Maximum rows per batch.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        import pyarrow.json as pa_json
+
+        cls._require_model()
+        table = pa_json.read_json(str(path))
+        source = TableSource(table, batch_size=batch_size)
+        return cls(source)
+
+    @classmethod
+    def from_feather(
+        cls,
+        path: str | Path,
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> ArrowFrame[Any]:
+        """Create a lazy frame from a Feather (Arrow IPC file) file.
+
+        Args:
+            path: Path to the ``.feather`` file.
+            batch_size: Maximum rows per batch.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        cls._require_model()
+        table = feather.read_table(str(path))
+        source = TableSource(table, batch_size=batch_size)
+        return cls(source)
+
+    @classmethod
+    def from_ipc(
+        cls,
+        data: bytes | str | Path,
+        *,
+        batch_size: int = _BATCH_SIZE,
+    ) -> ArrowFrame[Any]:
+        """Create a replayable frame from Arrow IPC stream bytes or a file path.
+
+        Args:
+            data: IPC stream as ``bytes`` (from :meth:`to_ipc`) or a path to an
+                  ``.arrow`` IPC stream file.
+            batch_size: Maximum rows per batch.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        cls._require_model()
+        if isinstance(data, str | Path):
+            with pa.memory_map(str(data), "rb") as source_file:
+                table = ipc.open_stream(source_file).read_all()
+        else:
+            buf = pa.BufferReader(data)
+            table = ipc.open_stream(buf).read_all()
+        return cls(TableSource(table, batch_size=batch_size))
 
     def append(
         self,
@@ -372,6 +506,166 @@ class ArrowFrame(Generic[T]):
         finally:
             if writer is not None:
                 writer.close()
+
+    def to_csv(self, path: str | Path, **kwargs: Any) -> None:
+        """Write the frame to a CSV file.
+
+        Args:
+            path: Destination file path.
+            **kwargs: Additional keyword arguments forwarded to
+                      :func:`pyarrow.csv.write_csv`.
+        """
+        import pyarrow.csv as pa_csv
+
+        table = self.to_arrow()
+        pa_csv.write_csv(table, str(path), **kwargs)
+
+    def to_feather(self, path: str | Path, **kwargs: Any) -> None:
+        """Write the frame to a Feather (Arrow IPC file) file.
+
+        Args:
+            path: Destination file path.
+            **kwargs: Additional keyword arguments forwarded to
+                      :func:`pyarrow.feather.write_feather`.
+        """
+        table = self.to_arrow()
+        feather.write_feather(table, str(path), **kwargs)
+
+    def to_ipc(self, path: str | Path | None = None) -> bytes | None:
+        """Serialize the frame as an Arrow IPC stream.
+
+        When *path* is ``None`` the serialized bytes are returned.
+        When *path* is provided the data is written to the file and
+        ``None`` is returned.
+
+        Args:
+            path: Optional destination file path.  If omitted, bytes are
+                  returned instead.
+
+        Returns:
+            IPC stream as ``bytes`` when *path* is ``None``, else ``None``.
+        """
+        table = self.to_arrow()
+        if path is not None:
+            with pa.OSFile(str(path), "wb") as sink, ipc.new_stream(sink, table.schema) as writer:
+                writer.write_table(table)
+            return None
+        sink = pa.BufferOutputStream()
+        with ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        return sink.getvalue().to_pybytes()  # type: ignore[no-any-return]
+
+    # ------------------------------------------------------------------
+    # Compute operations
+    # ------------------------------------------------------------------
+
+    def filter(
+        self,
+        predicate: pc.Expression | Callable[[Any], bool],
+    ) -> ArrowFrame[Any]:
+        """Return a new frame containing only rows that satisfy *predicate*.
+
+        Two forms are accepted:
+
+        - **Arrow expression** (efficient, applied at the Arrow level per batch):
+
+          .. code-block:: python
+
+              import pyarrow.compute as pc
+              frame.filter(pc.field("age") > 30)
+
+        - **Python callable** (model-level predicate, applied after validation):
+
+          .. code-block:: python
+
+              frame.filter(lambda user: user.age > 30)
+
+        Args:
+            predicate: An :class:`pyarrow.compute.Expression` or a Python
+                       callable that accepts a validated model instance and
+                       returns ``bool``.
+
+        Returns:
+            A new :class:`ArrowFrame` with only matching rows.
+        """
+        if callable(predicate) and not isinstance(predicate, pc.Expression):
+            return self._filter_callable(predicate)
+        return self._filter_expr(predicate)
+
+    def _filter_expr(self, expr: pc.Expression) -> ArrowFrame[Any]:
+        batches = [batch.filter(expr) for batch in self._source.iter_batches()]
+        table = pa.Table.from_batches(batches, schema=self._source.schema)
+        return type(self)(TableSource(table))
+
+    def _filter_callable(self, fn: Callable[[Any], bool]) -> ArrowFrame[Any]:
+        model = self._require_model()
+        kept: list[dict[str, Any]] = []
+        schema = self._source.schema
+        for batch in self._source.iter_batches():
+            for instance in batch_to_models(batch, model):
+                if fn(instance):
+                    kept.append(_to_dict(instance))
+        source = RowSource(kept, schema)
+        return type(self)(source)
+
+    def limit(self, n: int) -> ArrowFrame[Any]:
+        """Return a new frame with at most *n* rows, taken from the start.
+
+        The operation is lazy: batch iteration stops as soon as *n* rows have
+        been collected.
+
+        Args:
+            n: Maximum number of rows to keep.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        if n == 0:
+            return type(self)(TableSource(pa.table(self._source.schema.empty_table())))
+        collected: list[pa.RecordBatch] = []
+        remaining = n
+        for batch in self._source.iter_batches():
+            if batch.num_rows <= remaining:
+                collected.append(batch)
+                remaining -= batch.num_rows
+            else:
+                collected.append(batch.slice(0, remaining))
+                remaining = 0
+            if remaining == 0:
+                break
+        table = pa.Table.from_batches(collected, schema=self._source.schema)
+        return type(self)(TableSource(table))
+
+    def head(self, n: int) -> ArrowFrame[Any]:
+        """Return a new frame with the first *n* rows.
+
+        Alias for :meth:`limit`.
+
+        Args:
+            n: Number of rows to take from the start.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        return self.limit(n)
+
+    def tail(self, n: int) -> ArrowFrame[Any]:
+        """Return a new frame with the last *n* rows.
+
+        .. note::
+            This method materialises the full frame to determine the end.
+
+        Args:
+            n: Number of rows to take from the end.
+
+        Returns:
+            A new :class:`ArrowFrame`.
+        """
+        if n == 0:
+            return type(self)(TableSource(pa.table(self._source.schema.empty_table())))
+        table = self.to_arrow()
+        sliced = table.slice(max(0, table.num_rows - n))
+        return type(self)(TableSource(sliced))
 
     # ------------------------------------------------------------------
     # Internal helpers
