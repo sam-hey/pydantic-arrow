@@ -11,6 +11,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel
 
+from pydantic_arrow._convert import _to_dict
+
 __all__ = [
     "BatchReaderSource",
     "ConcatSource",
@@ -113,7 +115,9 @@ class ParquetSource:
         self._pf: pq.ParquetFile | None = None
 
     def _open(self) -> pq.ParquetFile:
-        return pq.ParquetFile(self._path)
+        if self._pf is None:
+            self._pf = pq.ParquetFile(self._path)
+        return self._pf
 
     @property
     def schema(self) -> pa.Schema:
@@ -275,5 +279,5 @@ class GeneratorSource:
             chunk = list(itertools.islice(self._iter, self._batch_size))
             if not chunk:
                 break
-            validated = [self._model.model_validate(row).model_dump() for row in chunk]
+            validated = [_to_dict(self._model.model_validate(row)) for row in chunk]
             yield pa.RecordBatch.from_pylist(validated, schema=self._schema)

@@ -6,7 +6,7 @@ import typing
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
-from typing import Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 from uuid import UUID
 
 import pyarrow as pa
@@ -43,7 +43,9 @@ def _resolve(annotation: Any, *, field_info: FieldInfo | None, nullable: bool) -
     """Recursively resolve a type annotation to (pa.DataType, nullable)."""
 
     # --- Annotated[T, ...] — check for a pa.DataType override first ---------
-    if typing_objects.is_annotated(get_origin(annotation)):
+    # get_origin(Annotated[T, ...]) returns the bare `Annotated` class, so
+    # comparing with `is Annotated` is the clearest way to detect this form.
+    if get_origin(annotation) is Annotated:
         base, *metadata = get_args(annotation)
         for meta in metadata:
             if isinstance(meta, pa.DataType):

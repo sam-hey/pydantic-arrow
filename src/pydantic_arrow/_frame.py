@@ -215,13 +215,15 @@ class ArrowFrame(Generic[T]):
         *,
         batch_size: int = _BATCH_SIZE,
     ) -> ArrowFrame[Any]:
-        """Create a lazy frame from a CSV file.
+        """Create a frame from a CSV file.
 
-        The CSV is read lazily; Arrow infers column types from the file content.
+        The entire CSV is read eagerly into an in-memory Arrow table; Arrow
+        infers column types from the file content.  Subsequent iteration over
+        the frame (``iter_batches``, ``collect``, etc.) is batched and lazy.
 
         Args:
             path: Path to the CSV file.
-            batch_size: Maximum rows per batch.
+            batch_size: Maximum rows per batch during iteration.
 
         Returns:
             A new :class:`ArrowFrame`.
@@ -240,11 +242,14 @@ class ArrowFrame(Generic[T]):
         *,
         batch_size: int = _BATCH_SIZE,
     ) -> ArrowFrame[Any]:
-        """Create a lazy frame from a newline-delimited JSON file.
+        """Create a frame from a newline-delimited JSON file.
+
+        The entire file is read eagerly into an in-memory Arrow table.
+        Subsequent iteration over the frame is batched and lazy.
 
         Args:
             path: Path to the JSON Lines file.
-            batch_size: Maximum rows per batch.
+            batch_size: Maximum rows per batch during iteration.
 
         Returns:
             A new :class:`ArrowFrame`.
@@ -263,11 +268,14 @@ class ArrowFrame(Generic[T]):
         *,
         batch_size: int = _BATCH_SIZE,
     ) -> ArrowFrame[Any]:
-        """Create a lazy frame from a Feather (Arrow IPC file) file.
+        """Create a frame from a Feather (Arrow IPC file) file.
+
+        The entire file is read eagerly into an in-memory Arrow table.
+        Subsequent iteration over the frame is batched and lazy.
 
         Args:
             path: Path to the ``.feather`` file.
-            batch_size: Maximum rows per batch.
+            batch_size: Maximum rows per batch during iteration.
 
         Returns:
             A new :class:`ArrowFrame`.
@@ -295,7 +303,7 @@ class ArrowFrame(Generic[T]):
             A new :class:`ArrowFrame`.
         """
         cls._require_model()
-        if isinstance(data, str | Path):
+        if isinstance(data, (str, Path)):  # noqa: UP038
             with pa.memory_map(str(data), "rb") as source_file:
                 table = ipc.open_stream(source_file).read_all()
         else:
@@ -324,7 +332,7 @@ class ArrowFrame(Generic[T]):
         Returns:
             A new :class:`ArrowFrame` of the same type.
         """
-        if isinstance(rows, dict | BaseModel):
+        if isinstance(rows, (dict, BaseModel)):  # noqa: UP038
             rows = [rows]
         model = self._require_model()
         schema = model_to_schema(model)
@@ -593,8 +601,7 @@ class ArrowFrame(Generic[T]):
         return self._filter_expr(predicate)
 
     def _filter_expr(self, expr: pc.Expression) -> ArrowFrame[Any]:
-        batches = [batch.filter(expr) for batch in self._source.iter_batches()]
-        table = pa.Table.from_batches(batches, schema=self._source.schema)
+        table = self.to_arrow().filter(expr)
         return type(self)(TableSource(table))
 
     def _filter_callable(self, fn: Callable[[Any], bool]) -> ArrowFrame[Any]:
@@ -621,7 +628,7 @@ class ArrowFrame(Generic[T]):
             A new :class:`ArrowFrame`.
         """
         if n == 0:
-            return type(self)(TableSource(pa.table(self._source.schema.empty_table())))
+            return type(self)(TableSource(self._source.schema.empty_table()))
         collected: list[pa.RecordBatch] = []
         remaining = n
         for batch in self._source.iter_batches():
@@ -662,7 +669,7 @@ class ArrowFrame(Generic[T]):
             A new :class:`ArrowFrame`.
         """
         if n == 0:
-            return type(self)(TableSource(pa.table(self._source.schema.empty_table())))
+            return type(self)(TableSource(self._source.schema.empty_table()))
         table = self.to_arrow()
         sliced = table.slice(max(0, table.num_rows - n))
         return type(self)(TableSource(sliced))

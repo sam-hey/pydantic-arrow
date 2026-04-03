@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, get_origin
 
 import pyarrow as pa
 from pydantic import BaseModel
+from pydantic.functional_validators import BeforeValidator
 
 from pydantic_arrow import ArrowFrame
 from pydantic_arrow._schema import model_to_schema
@@ -97,6 +98,56 @@ def test_annotated_non_arrow_metadata_falls_through():
     assert dtype == pa.int64()
 
 
+# ---------------------------------------------------------------------------
+# Regression tests for Annotated detection (get_origin(ann) is Annotated)
+#
+# Bug: the original code used typing_objects.is_annotated(get_origin(ann)),
+# relying on an opaque double-indirection.  The fix uses the explicit
+# `get_origin(annotation) is Annotated` form.  These tests pin the detection
+# mechanism so any future regression is caught immediately.
+# ---------------------------------------------------------------------------
+
+
+def test_get_origin_of_annotated_is_annotated_class():
+    """Prerequisite: get_origin(Annotated[T, ...]) must be the bare Annotated class.
+
+    This is the invariant the detection in _types._resolve() depends on.
+    If this fails, the entire Annotated branch will silently stop working.
+    """
+    assert get_origin(Annotated[int, pa.int32()]) is Annotated
+
+
+def test_annotated_detection_with_multiple_metadata_items():
+    """Arrow DataType override is found even when it is not the first metadata item."""
+    dtype, _ = python_type_to_arrow(Annotated[int, "description", pa.int8()])
+    assert dtype == pa.int8()
+
+
+def test_annotated_detection_first_arrow_type_wins():
+    """When two pa.DataType values appear, the first one is used."""
+    dtype, _ = python_type_to_arrow(Annotated[int, pa.int8(), pa.int16()])
+    assert dtype == pa.int8()
+
+
+def test_annotated_with_pydantic_validator_falls_through_to_base():
+    """Annotated[str, BeforeValidator(...)] carries no pa.DataType; base type used."""
+    dtype, _ = python_type_to_arrow(Annotated[str, BeforeValidator(str.strip)])
+    assert dtype == pa.utf8()
+
+
+def test_annotated_nullable_preserves_override():
+    """Nullability is preserved when Annotated wraps an Optional."""
+    dtype, nullable = python_type_to_arrow(Annotated[int, pa.int8()] | None)
+    assert dtype == pa.int8()
+    assert nullable is True
+
+
+def test_annotated_non_nullable_by_default():
+    """Annotated override without Optional is non-nullable."""
+    _, nullable = python_type_to_arrow(Annotated[int, pa.int8()])
+    assert nullable is False
+
+
 class SensorReading(BaseModel):
     sensor_id: Annotated[int, pa.int16()]
     temperature: Annotated[float, pa.float32()]
@@ -116,6 +167,16 @@ def test_annotated_round_trip():
     result = list(frame)
     assert result[0].sensor_id == 1
     assert abs(result[0].temperature - 23.5) < 0.01
+
+
+def test_annotated_round_trip_via_from_iterable():
+    """Annotated DataType overrides work end-to-end through GeneratorSource."""
+    frame = ArrowFrame[SensorReading].from_iterable(iter([{"sensor_id": 42, "temperature": 0.5, "label": "test"}]))
+    schema = frame.schema
+    assert schema.field("sensor_id").type == pa.int16()
+    assert schema.field("temperature").type == pa.float32()
+    result = frame.collect()
+    assert result[0].sensor_id == 42
 
 
 # ---------------------------------------------------------------------------

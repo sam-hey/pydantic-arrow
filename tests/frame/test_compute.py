@@ -108,8 +108,10 @@ class TestLimit:
         assert len(result) == 3
 
     def test_limit_zero(self, frame):
-        result = list(frame.limit(0))
-        assert result == []
+        """limit(0) must return an empty frame with the correct schema, not raise."""
+        limited = frame.limit(0)
+        assert list(limited) == []
+        assert limited.schema == frame.schema
 
     def test_limit_larger_than_data(self, frame):
         result = list(frame.limit(100))
@@ -150,8 +152,10 @@ class TestTail:
         assert result[-1].value == 50
 
     def test_tail_zero(self, frame):
-        result = list(frame.tail(0))
-        assert result == []
+        """tail(0) must return an empty frame with the correct schema, not raise."""
+        tailed = frame.tail(0)
+        assert list(tailed) == []
+        assert tailed.schema == frame.schema
 
     def test_tail_larger_than_data(self, frame):
         result = list(frame.tail(100))
